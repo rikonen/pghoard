@@ -274,7 +274,7 @@ class DecryptorFile(FileWrap):
             elif self.offset < offset:
                 self.read(offset - self.offset)
                 return self.offset
-            elif self.offset > offset:
+            else:  # if self.offset > offset
                 # simulate backward seek by restarting from the beginning
                 self.next_fp.seek(0)
                 self._reset()

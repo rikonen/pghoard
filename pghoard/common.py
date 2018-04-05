@@ -152,6 +152,7 @@ def default_json_serialization(obj):
             return obj.isoformat().replace("+00:00", "Z")
         # assume UTC for datetime objects without a timezone
         return obj.isoformat() + "Z"
+    return None
 
 
 def json_encode(obj, compact=True, binary=False):
