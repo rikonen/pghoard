@@ -94,6 +94,7 @@ class GoogleTransfer(BaseTransfer):
         self.gs_object_client = None
         self.bucket_name = self.get_or_create_bucket(bucket_name)
         self.log.debug("GoogleTransfer initialized")
+        self.chunk_size = CHUNK_SIZE
 
     def _init_google_client(self):
         start_time = time.monotonic()
@@ -225,7 +226,7 @@ class GoogleTransfer(BaseTransfer):
         next_prog_report = 0.0
         with self._object_client(not_found=key) as clob:
             req = clob.get_media(bucket=self.bucket_name, object=key)
-            download = MediaIoBaseDownload(fileobj_to_store_to, req, chunksize=CHUNK_SIZE)
+            download = MediaIoBaseDownload(fileobj_to_store_to, req, chunksize=self.chunk_size)
             done = False
             while not done:
                 status, done = self._retry_on_reset(getattr(download, "_request", None), download.next_chunk)
@@ -249,7 +250,7 @@ class GoogleTransfer(BaseTransfer):
         key = self.format_key_for_backend(key)
         self.log.debug("Starting to upload %r", key)
         upload = upload_type(local_object, mimetype="application/octet-stream",
-                             resumable=True, chunksize=CHUNK_SIZE)
+                             resumable=True, chunksize=self.chunk_size)
         body = {"metadata": metadata}
         if extra_props:
             body.update(extra_props)
