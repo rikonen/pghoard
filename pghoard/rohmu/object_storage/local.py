@@ -31,6 +31,11 @@ class LocalTransfer(BaseTransfer):
         except FileNotFoundError:
             return {}
 
+    def get_metadata_and_size_for_key(self, key):
+        metadata = self.get_metadata_for_key(key)
+        stat = os.stat(self.format_key_for_backend(key.strip("/")))
+        return metadata, stat.st_size
+
     def delete_key(self, key):
         self.log.debug("Deleting key: %r", key)
         target_path = self.format_key_for_backend(key.strip("/"))

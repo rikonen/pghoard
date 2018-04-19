@@ -167,12 +167,17 @@ class GoogleTransfer(BaseTransfer):
     def get_metadata_for_key(self, key):
         key = self.format_key_for_backend(key)
         with self._object_client(not_found=key) as clob:
-            return self._metadata_for_key(clob, key)
+            return self._metadata_and_size_for_key(clob, key)[0]
 
-    def _metadata_for_key(self, clob, key):
+    def get_metadata_and_size_for_key(self, key):
+        key = self.format_key_for_backend(key)
+        with self._object_client(not_found=key) as clob:
+            return self._metadata_and_size_for_key(clob, key)
+
+    def _metadata_and_size_for_key(self, clob, key):
         req = clob.get(bucket=self.bucket_name, object=key)
         obj = self._retry_on_reset(req, req.execute)
-        return obj.get("metadata", {})
+        return obj.get("metadata", {}), int(obj["size"])
 
     def _unpaginate(self, domain, initial_op):
         """Iterate thru the request pages until all items have been processed"""
@@ -237,7 +242,7 @@ class GoogleTransfer(BaseTransfer):
                     if progress_callback and progress_pct > next_prog_report:
                         progress_callback(progress_pct, 100)
                         next_prog_report = progress_pct + 0.1
-            return self._metadata_for_key(clob, key)
+            return self._metadata_and_size_for_key(clob, key)[0]
 
     def get_contents_to_string(self, key):
         key = self.format_key_for_backend(key)
@@ -245,7 +250,7 @@ class GoogleTransfer(BaseTransfer):
         with self._object_client(not_found=key) as clob:
             req = clob.get_media(bucket=self.bucket_name, object=key)
             data = self._retry_on_reset(req, req.execute)
-            return data, self._metadata_for_key(clob, key)
+            return data, self._metadata_and_size_for_key(clob, key)[0]
 
     def _upload(self, upload_type, local_object, key, metadata, extra_props, cache_control):
         key = self.format_key_for_backend(key)

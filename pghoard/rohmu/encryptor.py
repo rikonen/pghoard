@@ -156,6 +156,8 @@ class Decryptor:
             self.authenticator = HMAC(auth_key, SHA256(), backend=default_backend())
 
     def process_data(self, data):
+        if not data:
+            return b""
         self.authenticator.update(data)
         return self.cipher.update(data)
 

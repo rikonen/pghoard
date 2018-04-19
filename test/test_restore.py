@@ -148,7 +148,7 @@ class TestBasebackupFetcher(unittest.TestCase):
         config = {"restore_process_count": 4}
         site = "some-site"
         pgdata = "/tmp/test_restore"
-        tablespaces = {"foo": {"path": "/tmp/test_restore2"}}
+        tablespaces = {"foo": {"oid": 1234, "path": "/tmp/test_restore2"}}
         data_files = [("bar1", 1000), ("bar2", 2000), ((b"baz", {}), 0)]
         fetcher = BasebackupFetcher(app_config=config,
                                     data_files=data_files,
@@ -240,7 +240,7 @@ class TestBasebackupFetcher(unittest.TestCase):
                                     debug=True,
                                     pgdata=restore_dir,
                                     site="f73f56ee-6b9f-4ce0-b7aa-a170d58da833",
-                                    tablespaces=[])
+                                    tablespaces={})
         try:
             logic(fetcher, restore_dir)
         finally:

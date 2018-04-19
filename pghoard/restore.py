@@ -9,7 +9,7 @@ from .patchedtarfile import tarfile
 from .postgres_command import PGHOARD_HOST, PGHOARD_PORT
 # ignore pylint/distutils issue, https://github.com/PyCQA/pylint/issues/73
 from distutils.version import LooseVersion  # pylint: disable=no-name-in-module,import-error
-from pghoard.rohmu import compat, dates, get_transfer, IO_BLOCK_SIZE, rohmufile
+from pghoard.rohmu import compat, dates, encryptor, get_transfer, rohmufile
 from pghoard.rohmu.errors import Error, InvalidConfigurationError
 from psycopg2.extensions import adapt
 from requests import Session
@@ -23,6 +23,8 @@ import multiprocessing.pool
 import os
 import re
 import shutil
+import snappy
+import subprocess
 import sys
 import tempfile
 import time
@@ -465,6 +467,25 @@ class BasebackupFetcher():
 
         if self.errors:
             raise RestoreError("Backup download/extraction failed with {} errors".format(self.errors))
+        self._create_tablespace_symlinks()
+
+    def _create_tablespace_symlinks(self):
+        if not self.tablespaces:
+            return
+        tblspc_dir = os.path.join(self.pgdata, "pg_tblspc")
+        os.makedirs(tblspc_dir, exist_ok=True)
+        for tsname, settings in self.tablespaces.items():
+            if os.path.isdir(settings["path"]):
+                linkname = os.path.join(self.pgdata, "pg_tblspc", str(settings["oid"]))
+                os.symlink(settings["path"], linkname)
+                # XXX: Fix owner and permissions
+        # Remove empty directories that could not be excluded when extracting tar due to
+        # tar's limitations in exclude parameter behavior
+        for exclude in ["pgdata", "tablespaces"]:
+            try:
+                os.rmdir(os.path.join(self.pgdata, exclude))
+            except OSError:
+                pass
 
     def _process_count(self):
         return min(self.config["restore_process_count"], len(self.data_files))
@@ -578,99 +599,92 @@ class ChunkFetcher:
         self.log.debug("Processing one chunk: %r", self.data_file)
         if isinstance(self.data_file, tuple):
             data, metadata = self.data_file
-            tmp = io.BytesIO(data)
+            self.download_and_extract_one_backup(metadata=metadata, file_size=len(data), input_data=io.BytesIO(data))
         else:
-            tmp, metadata = self.download_one_backup()
+            try:
+                self.download_and_extract_one_backup()
+            except Exception:
+                self.log.exception("Failed to download")
+                raise
 
-        self.extract_one_backup(obj=tmp, metadata=metadata)
+    def build_tar_args(self, metadata):
+        base_args = ["tar", "-xf", "-", "-C", self.pgdata]
+        if metadata.get("format") in ("pghoard-bb-v1", "pghoard-bb-v2"):
+            extra_args = [
+                "--exclude", ".pghoard_tar_metadata.json",
+                "--transform", "s,^pgdata/,,",
+            ]
+            if self.tablespaces:
+                extra_args.append("--absolute-names")
+            for tsname, config in self.tablespaces.items():
+                extra_args.append("--transform")
+                extra_args.append(r"s,^tablespaces/{}/\(.*\)$,{}/\1,".format(tsname, config["path"]))
+            return base_args + extra_args
+        elif not metadata.get("format"):
+            return base_args
+        else:
+            raise RestoreError("Unrecognized basebackup format {!r}".format(metadata.get("format")))
 
-    def download_one_backup(self):
-        dl_dir = os.path.join(
-            self.config["backup_location"],
-            self.config["backup_sites"][self.site]["prefix"],
-            "basebackup_incoming",
-        )
-        compat.makedirs(dl_dir, exist_ok=True)
-        tmp = tempfile.NamedTemporaryFile(dir=dl_dir, prefix="basebackup.", suffix=".pghoard")
+    def download_and_extract_one_backup(self, metadata=None, file_size=None, input_data=None):
+        if metadata is None or file_size is None or input_data is None:
+            transfer = self._create_transfer()
+            metadata, file_size = transfer.get_metadata_and_size_for_key(self.data_file)
+
+        args = self.build_tar_args(metadata)
+        tar = subprocess.Popen(args, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        class Sink:
+            def __init__(self, plain_output, metadata, file_size, key_lookup):
+                self.file_size = file_size
+                self.plain_output = plain_output
+                self.pending_data = None
+                self.decompressor = snappy.StreamDecompressor()
+                key_data = key_lookup(metadata["encryption-key-id"])
+                self.decryptor = encryptor.Decryptor(key_data)
+                self.data_bytes_received = 0
+                self.data_size = 0
+                self.footer = b""
+
+            def write(self, data):
+                offset = 0
+                # XXX: Does not work correctly if data is smaller than expected header size
+                while self.decryptor.expected_header_bytes() > 0:
+                    header_bytes = self.decryptor.expected_header_bytes()
+                    self.decryptor.process_header(data[offset:offset + header_bytes])
+                    offset += header_bytes
+                if offset > 0:
+                    data = data[offset:]
+                    self.data_size = self.file_size - offset - self.decryptor.footer_size()
+                expected_data_bytes = self.data_size - self.data_bytes_received
+                if len(data) > expected_data_bytes:
+                    self.footer += data[expected_data_bytes:]
+                    data = data[:expected_data_bytes]
+                self.data_bytes_received += len(data)
+                data = self.decryptor.process_data(data)
+                if len(self.footer) == self.decryptor.footer_size():
+                    data += self.decryptor.finalize(self.footer)
+                if not data:
+                    return
+                data = self.decompressor.decompress(data)
+                data = memoryview(data)
+                offset = 0
+                while offset < len(data):
+                    offset += self.plain_output.write(data[offset:])
+
+        sink = Sink(tar.stdin, metadata, file_size, config.key_lookup_for_site(self.config, self.site))
         try:
-            metadata = self._create_transfer().get_contents_to_fileobj(
-                key=self.data_file,
-                fileobj_to_store_to=tmp,
-                progress_callback=self._progress_callback)
-            self._progress_callback(1, 1)
-            self.log.info("Downloaded %r", self.data_file)
-            tmp.seek(0)
-        except:  # pylint: disable=bare-except
-            self.log.exception("Problem downloading a backup file: %r", self.data_file)
-            tmp.close()
+            if input_data is None:
+                transfer.get_contents_to_fileobj(self.data_file, sink, progress_callback=self._progress_callback)
+            else:
+                shutil.copyfileobj(input_data, sink)
+        except BrokenPipeError:
+            self.log.info("stderr", repr(tar.stderr.read()))
             raise
-        return tmp, metadata
-
-    def extract_one_backup(self, *, obj, metadata):
-        with obj:
-            with rohmufile.file_reader(fileobj=obj, metadata=metadata,
-                                       key_lookup=config.key_lookup_for_site(self.config, self.site)) as input_obj:
-                if metadata.get("format") in ("pghoard-bb-v1", "pghoard-bb-v2"):
-                    self._extract_pghoard_bb_v1_v2(input_obj)
-                elif not metadata.get("format"):
-                    self._extract_basic(input_obj)
-                else:
-                    raise RestoreError("Unrecognized basebackup format {!r}".format(metadata.get("format")))
-        self.log.info("Extracted %r %r", obj, metadata)
-
-    def _extract_pghoard_bb_v1_v2(self, fileobj):
-        directories = []
-        # | in mode to use tarfile's internal stream buffer manager, currently required because our SnappyFile
-        # interface doesn't do proper buffering for reads
-        with tarfile.open(fileobj=fileobj, mode="r|", bufsize=IO_BLOCK_SIZE) as tar:
-            for tarinfo in tar:
-                if tarinfo.name in (".pghoard_tar_metadata.json", "pgdata", "tablespaces"):
-                    continue  # ignore
-
-                if tarinfo.name.startswith("pgdata/"):
-                    target_name = os.path.join(self.pgdata, tarinfo.name[7:])
-                elif tarinfo.name.startswith("tablespaces/"):
-                    tscomponents = tarinfo.name.split("/", 2)
-                    tsname = tscomponents[1]
-                    tspath = self.tablespaces[tsname]["path"]
-
-                    if len(tscomponents) == 2 and tarinfo.isdir():
-                        # Create tablespace entry
-                        tblspc_dir = os.path.join(self.pgdata, "pg_tblspc")
-                        os.makedirs(tblspc_dir, exist_ok=True)
-                        linkname = os.path.join(self.pgdata, "pg_tblspc", str(self.tablespaces[tsname]["oid"]))
-                        os.symlink(tspath, linkname)
-                        directories.append([tspath, tarinfo])
-                        continue
-
-                    target_name = os.path.join(tspath, tscomponents[2])
-                else:
-                    raise Exception("Unrecognized path {!r} in tar".format(tarinfo.name))
-
-                if tarinfo.isdir():
-                    directories.append([target_name, tarinfo])
-                    compat.makedirs(target_name, exist_ok=True)
-                elif tarinfo.isreg():
-                    target_dir = os.path.dirname(target_name)
-                    if not os.path.exists(target_dir):
-                        compat.makedirs(target_dir, exist_ok=True)
-                    tar.makefile(tarinfo, target_name)
-                    tar.chmod(tarinfo, target_name)
-                    tar.utime(tarinfo, target_name)
-                elif tarinfo.issym():
-                    os.symlink(tarinfo.linkname, target_name)
-                else:
-                    raise Exception("Unrecognized file type for file {!r} in tar".format(tarinfo.name))
-
-        for target_name, tarinfo in directories:
-            tar.chmod(tarinfo, target_name)
-            tar.utime(tarinfo, target_name)
-
-    def _extract_basic(self, fileobj):
-        # | in mode to use tarfile's internal stream buffer manager, currently required because our SnappyFile
-        # interface doesn't do proper buffering for reads
-        with tarfile.open(fileobj=fileobj, mode="r|", bufsize=IO_BLOCK_SIZE) as tar:
-            tar.extractall(self.pgdata)
+        tar.stdin.close()
+        err = tar.stderr.read()
+        retval = tar.wait(timeout=0.5)
+        self.log.info("Processing of %r completed with result code %r, output %r",
+                      "<bytes>" if isinstance(self.data_file, tuple) else self.data_file, retval, err)
 
 
 class ObjectStore:
